@@ -4,10 +4,28 @@ import numpy as np
 import warnings
 from utils import to_dataset, to_dataset_ignore_na
 
-torch.set_default_dtype(torch.double)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.set_default_device(device)
+# As opposed to torch.double
+torch.set_default_dtype(torch.float32)
 
+def _configure_device():
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        props = torch.cuda.get_device_properties(device)
+        is_amd = "AMD" in props.name or hasattr(torch.version, 'hip')
+        
+        if not is_amd:
+            # NVIDIA-specific optimizations
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        else:
+            # AMD/ROCm — cudnn flags are no-ops, skip them
+            pass
+        return device, is_amd
+    return torch.device("cpu"), False
+
+device, IS_AMD = _configure_device()
+torch.set_default_device(device)
 
 class FeatureDependentMarkovChain():
     def __init__(self, num_states, mask=None, lam_frob=0.1, W_lap_states=None,
@@ -177,6 +195,11 @@ class FeatureDependentMarkovChain():
     # ------------------------------------------------------------------
     def _logistic_regression_batched(self, ws, Xs, Ys, lam, warm_start=False,
                                      W_lap_states=None, W_lap_features=None, **kwargs):
+
+        # Use float32 on NVIDIA (big throughput gain vs float64)
+        # Keep float64 on AMD until you've verified bfloat16 support on your card
+        precision = torch.float32 if not IS_AMD else torch.float64
+
         m = Xs[0].shape[1]
 
         if warm_start and hasattr(self, "As") and hasattr(self, "bs"):
@@ -192,7 +215,7 @@ class FeatureDependentMarkovChain():
 
         # Upload all data to GPU once — pin_memory speeds the host→device copy
         ws_tensor = [torch.from_numpy(w).to(device, non_blocking=True) for w in ws]
-        Xs_tensor = [torch.from_numpy(X).to(device, non_blocking=True) for X in Xs]
+        Xs_tensor = [torch.from_numpy(X).to(device, dtype=precision, non_blocking=True) for X in Xs]
         Ys_tensor = [torch.from_numpy(Y).to(device, non_blocking=True) for Y in Ys]
         total_weight = sum(w.sum().item() for w in ws_tensor)
 

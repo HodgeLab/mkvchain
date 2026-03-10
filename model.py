@@ -231,7 +231,7 @@ class FeatureDependentMarkovChain():
                            lam, W_lap_states, W_lap_features, total_weight):
         """Mini-batch training - updates weights using small chunks of data"""
         # Use Adam for mini-batch training
-        opt = torch.optim.Adam(As + bs, lr=0.01)
+        opt = torch.optim.Adam(As + bs, lr=0.01) # .to(device)?
         loss_fn = torch.nn.KLDivLoss(reduction='none')
         lsm = torch.nn.LogSoftmax(dim=1)
 

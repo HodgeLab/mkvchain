@@ -202,21 +202,23 @@ class FeatureDependentMarkovChain():
 
         m = Xs[0].shape[1]
 
+        # Warm start path — cast when loading from numpy
         if warm_start and hasattr(self, "As") and hasattr(self, "bs"):
-            As = [torch.from_numpy(A.copy()).to(device).requires_grad_(True)
-                  for A in self.As]
-            bs = [torch.from_numpy(b.copy()).to(device).requires_grad_(True)
-                  for b in self.bs]
+            As = [torch.from_numpy(A.copy()).to(device, dtype=precision).requires_grad_(True)
+                for A in self.As]
+            bs = [torch.from_numpy(b.copy()).to(device, dtype=precision).requires_grad_(True)
+                for b in self.bs]
+        # Cold start path — zeros inherit default dtype, so force it explicitly
         else:
-            As = [torch.zeros(m, Ys[i].shape[1], requires_grad=True,
-                              device=device) for i in range(self.n)]
-            bs = [torch.zeros(Ys[i].shape[1], requires_grad=True,
-                              device=device) for i in range(self.n)]
+            As = [torch.zeros(m, Ys[i].shape[1], dtype=precision,
+                            device=device, requires_grad=True) for i in range(self.n)]
+            bs = [torch.zeros(Ys[i].shape[1], dtype=precision,
+                            device=device, requires_grad=True) for i in range(self.n)]
 
         # Upload all data to GPU once — pin_memory speeds the host→device copy
-        ws_tensor = [torch.from_numpy(w).to(device, non_blocking=True) for w in ws]
+        ws_tensor = [torch.from_numpy(w).to(device, dtype=precision, non_blocking=True) for w in ws]
         Xs_tensor = [torch.from_numpy(X).to(device, dtype=precision, non_blocking=True) for X in Xs]
-        Ys_tensor = [torch.from_numpy(Y).to(device, non_blocking=True) for Y in Ys]
+        Ys_tensor = [torch.from_numpy(Y).to(device, dtype=precision, non_blocking=True) for Y in Ys]
         total_weight = sum(w.sum().item() for w in ws_tensor)
 
         if self.mini_batch_size is None:

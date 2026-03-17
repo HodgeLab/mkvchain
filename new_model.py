@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import warnings
-from utils import to_dataset, to_dataset_ignore_na
+from utils import to_dataset, to_dataset_ignore_na  # still used by score() legacy path
 
 # As opposed to torch.double
 torch.set_default_dtype(torch.float32)
@@ -80,105 +80,55 @@ class FeatureDependentMarkovChain():
                 self.W_lap_features.data).to(device)
 
     # ------------------------------------------------------------------
-    # Data preparation
-    # ------------------------------------------------------------------
-    def _prepare_batched_data(self, states, features, lengths, use_predictions=False):
-        sequence_indices = []
-        start_idx = 0
-        for length in lengths:
-            if length > 1:
-                sequence_indices.append((start_idx, start_idx + length))
-            start_idx += length
-
-        batch_size = len(sequence_indices) if self.batch_size is None else min(
-            self.batch_size, len(sequence_indices))
-
-        batched_data = []
-        for batch_start in range(0, len(sequence_indices), batch_size):
-            batch_sequences = sequence_indices[batch_start:batch_start + batch_size]
-
-            X = {i: [] for i in range(self.n)}
-            Y = {i: [] for i in range(self.n)}
-            weights = {i: [] for i in range(self.n)}
-
-            for si, ei in batch_sequences:
-                s = states[si:ei]
-                f = features[si:ei]
-
-                if use_predictions and hasattr(self, 'As'):
-                    Ps = self.predict(f[:-1])
-                    l = to_dataset(list(Ps), s, f)
-                else:
-                    l = to_dataset_ignore_na(s, f, self.n)
-
-                for feat, w, state, next_state in l:
-                    zero = self.zero[state]
-                    if np.any(next_state[zero] > 0):
-                        warnings.warn(
-                            f"Transition from {state} to {next_state} impossible "
-                            "according to mask. Ignoring transition.")
-                        continue
-                    if np.any(np.isnan(feat)):
-                        continue
-                    X[state].append(feat)
-                    Y[state].append(next_state)
-                    weights[state].append(w)
-
-            batched_data.append((X, Y, weights))
-
-        return batched_data
-
-    # ------------------------------------------------------------------
     # Public: fit
+    #
+    # Accepts pre-extracted transition arrays (from load_transitions()) instead
+    # of raw sequences + lengths.  This eliminates the expensive Python loop
+    # over sequences that previously dominated wall-clock time.
+    #
+    # Args:
+    #   Xs: list of n arrays, Xs[i] shape (N_i, m)  — features at time t
+    #   Ys: list of n arrays, Ys[i] shape (N_i, n)  — one-hot next states
+    #   ws: list of n arrays, ws[i] shape (N_i,)     — transition weights
     # ------------------------------------------------------------------
-    def fit(self, states, features, lengths, verbose=False, warm_start=False, **kwargs):
-        N, m = features.shape
-        self.models = {}
+    def fit(self, Xs, Ys, ws, verbose=False, warm_start=False, **kwargs):
+        # Infer feature dimension from the first non-empty state
+        m = next(X.shape[1] for X in Xs if len(X) > 0)
         prev_loss = float("inf")
         self._cache_laplacian_edges()
 
+        # Validate and apply mask column selection once up front
+        Xs_masked, Ys_masked, ws_masked = [], [], []
+        for i in range(self.n):
+            noutputs = self.sizes[i]
+            if len(ws[i]) == 0:
+                warnings.warn(
+                    f"No pairs found starting from state {i}. "
+                    "Results from this state may be inaccurate.")
+                ws_masked.append(np.ones(1))
+                Xs_masked.append(np.zeros((1, m)))
+                Yi = np.zeros((1, noutputs))
+                Yi[0, :] = 1 / noutputs
+                Ys_masked.append(Yi)
+            else:
+                ws_masked.append(np.asarray(ws[i]))
+                Xs_masked.append(np.asarray(Xs[i]))
+                # Select only the columns corresponding to reachable next states
+                Ys_masked.append(np.asarray(Ys[i])[:, self.nonzero[i]])
+
+        # n_iter loop retained for EM-style re-estimation compatibility;
+        # with pre-extracted transitions (no NaN states) this runs once (n_iter=1)
         for k in range(self.n_iter):
-            use_predictions = k > 0 and hasattr(self, 'As')
-            batched_data = self._prepare_batched_data(
-                states, features, lengths, use_predictions)
-
-            X_all = {i: [] for i in range(self.n)}
-            Y_all = {i: [] for i in range(self.n)}
-            weights_all = {i: [] for i in range(self.n)}
-
-            for X_batch, Y_batch, weights_batch in batched_data:
-                for i in range(self.n):
-                    X_all[i].extend(X_batch[i])
-                    Y_all[i].extend(Y_batch[i])
-                    weights_all[i].extend(weights_batch[i])
-
-            ws, Xs, Ys = [], [], []
-            for i in range(self.n):
-                noutputs = self.sizes[i]
-                if len(weights_all[i]) == 0:
-                    warnings.warn(
-                        f"No pairs found starting from state {i}. "
-                        "Results from this state may be inaccurate.")
-                    weightsi = np.ones(1)
-                    Xi = np.zeros((1, m))
-                    Yi = np.zeros((1, noutputs))
-                    Yi[0, :] = 1 / noutputs
-                else:
-                    weightsi = np.array(weights_all[i])
-                    Xi = np.array(X_all[i])
-                    Yi = np.array(Y_all[i])
-                ws.append(weightsi)
-                Xs.append(Xi)
-                Ys.append(Yi[:, self.nonzero[i]])
-
             if self.lam_col_norm == 0.0:
                 self.As, self.bs, loss = self._logistic_regression_batched(
-                    ws, Xs, Ys, self.lam, warm_start=warm_start,
+                    ws_masked, Xs_masked, Ys_masked, self.lam,
+                    warm_start=warm_start,
                     W_lap_states=self.W_lap_states,
                     W_lap_features=self.W_lap_features, **kwargs)
             else:
                 self.As, self.bs, loss = self._logistic_regression_column_norm_batched(
-                    ws, Xs, Ys, self.lam, warm_start=warm_start,
+                    ws_masked, Xs_masked, Ys_masked, self.lam,
+                    warm_start=warm_start,
                     W_lap_states=self.W_lap_states,
                     W_lap_features=self.W_lap_features,
                     lam_col_norm=self.lam_col_norm, **kwargs)
@@ -418,52 +368,74 @@ class FeatureDependentMarkovChain():
         return P.cpu().numpy()  # (T, n, n)
 
     # ------------------------------------------------------------------
-    # score — GPU-accelerated, avoids redundant full predict() calls
+    # score
+    #
+    # Two calling conventions:
+    #   Pre-extracted:  score(Xs, Ys)
+    #     Xs: list of n arrays (N_i, m)
+    #     Ys: list of n arrays (N_i, n)  — full one-hot rows (not masked)
+    #
+    #   Legacy sequence: score(states, features, lengths)  [still supported]
     # ------------------------------------------------------------------
-    def score(self, states, features, lengths, average=False):
-        X = {i: [] for i in range(self.n)}
-        Y = {i: [] for i in range(self.n)}
-        idx = 0
-        for length in lengths:
-            if length <= 1:
-                idx += length
-                continue
-            s = states[idx:idx + length]
-            f = features[idx:idx + length]
-            l = to_dataset_ignore_na(s, f, self.n)
-            for feat, w, state, next_state in l:
-                if np.any(next_state[self.zero[state]] > 0):
-                    warnings.warn(
-                        f"Transition from {state} to {next_state} impossible. "
-                        "Ignoring.")
-                    continue
-                if np.any(np.isnan(feat)):
-                    continue
-                X[state].append(feat)
-                Y[state].append(next_state)
-            idx += length
+    def score(self, Xs_or_states, Ys_or_features=None, lengths_or_none=None,
+              average=False):
 
+        # ── Detect calling convention ──────────────────────────────────
+        if (isinstance(Xs_or_states, list) and
+                len(Xs_or_states) == self.n and
+                isinstance(Xs_or_states[0], np.ndarray)):
+            # Pre-extracted path: score(Xs, Ys)
+            Xs = Xs_or_states
+            Ys = Ys_or_features
+        else:
+            # Legacy path: score(states, features, lengths)
+            states   = Xs_or_states
+            features = Ys_or_features
+            lengths  = lengths_or_none
+            Xs = {i: [] for i in range(self.n)}
+            Ys = {i: [] for i in range(self.n)}
+            idx = 0
+            for length in lengths:
+                if length <= 1:
+                    idx += length
+                    continue
+                s = states[idx:idx + length]
+                f = features[idx:idx + length]
+                l = to_dataset_ignore_na(s, f, self.n)
+                for feat, w, state, next_state in l:
+                    if np.any(next_state[self.zero[state]] > 0):
+                        warnings.warn(
+                            f"Transition from {state} to {next_state} impossible. "
+                            "Ignoring.")
+                        continue
+                    if np.any(np.isnan(feat)):
+                        continue
+                    Xs[state].append(feat)
+                    Ys[state].append(next_state)
+                idx += length
+            Xs = [np.array(Xs[i]) for i in range(self.n)]
+            Ys = [np.array(Ys[i]) for i in range(self.n)]
+
+        # ── GPU log-likelihood computation ─────────────────────────────
         ll = 0.0
         ct = 0
         with torch.no_grad():
-            # Infer precision from stored weights
             precision = torch.from_numpy(self.As[0]).dtype
 
             for i in range(self.n):
-                if len(X[i]) == 0:
+                if len(Xs[i]) == 0:
                     continue
-                ct += len(X[i])
-                # Only compute the row for state i — avoids full n×n prediction
-                Xi = torch.from_numpy(np.array(X[i])).to(device, dtype=precision, non_blocking=True)
-                A_i = torch.from_numpy(self.As[i]).to(device, dtype=precision, non_blocking=True)
-                b_i = torch.from_numpy(self.bs[i]).to(device, dtype=precision, non_blocking=True)
-                logits = Xi @ A_i + b_i
-                log_probs_nz = F.log_softmax(logits, dim=1)  # (T, |nonzero[i]|)
+                ct += len(Xs[i])
+                Xi   = torch.from_numpy(np.asarray(Xs[i])).to(device, dtype=precision, non_blocking=True)
+                A_i  = torch.from_numpy(self.As[i]).to(device, dtype=precision, non_blocking=True)
+                b_i  = torch.from_numpy(self.bs[i]).to(device, dtype=precision, non_blocking=True)
+                logits       = Xi @ A_i + b_i
+                log_probs_nz = F.log_softmax(logits, dim=1)  # (N_i, |nonzero[i]|)
 
-                Yi = np.array(Y[i])[:, self.nonzero[i]]   # (T, |nonzero[i]|)
+                # Select only the reachable columns from the full one-hot Ys
+                Yi   = np.asarray(Ys[i])[:, self.nonzero[i]]
                 Yi_t = torch.from_numpy(Yi).to(device, dtype=precision, non_blocking=True)
 
-                # Replace -inf contributions with 0 (matches original behaviour)
                 lp = log_probs_nz.clamp(min=torch.finfo(precision).min)
                 ll += (lp * Yi_t).sum().item()
 
